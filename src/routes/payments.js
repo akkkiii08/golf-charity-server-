@@ -76,66 +76,89 @@ router.post('/webhook', async (req, res) => {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  switch (event.type) {
-    case 'checkout.session.completed': {
-      const session = event.data.object;
-      const { userId, plan } = session.metadata;
+  try {
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        const userId = session.metadata?.userId;
+        const plan = session.metadata?.plan;
 
-      // Create subscription record
-      const stripeSubscription = await stripe.subscriptions.retrieve(session.subscription);
-      const amount = PLANS[plan]?.amount || 999;
-      const prizePoolContrib = Math.floor(amount * PRIZE_POOL_RATIO);
+        // Some test events are generic and may not carry app metadata.
+        if (!userId || !plan || !PLANS[plan] || !session.subscription) {
+          console.warn('Ignoring checkout.session.completed with missing metadata/subscription', {
+            eventId: event.id,
+            userId,
+            plan,
+            hasSubscription: Boolean(session.subscription),
+          });
+          break;
+        }
 
-      const { data: sub } = await supabase
-        .from('subscriptions')
-        .insert({
+        const stripeSubscription = await stripe.subscriptions.retrieve(session.subscription);
+        const amount = PLANS[plan].amount;
+        const prizePoolContrib = Math.floor(amount * PRIZE_POOL_RATIO);
+
+        const { data: sub, error: subError } = await supabase
+          .from('subscriptions')
+          .insert({
+            user_id: userId,
+            plan,
+            status: 'active',
+            stripe_subscription_id: stripeSubscription.id,
+            amount_pence: amount,
+            current_period_start: new Date(stripeSubscription.current_period_start * 1000),
+            current_period_end:   new Date(stripeSubscription.current_period_end   * 1000),
+          })
+          .select()
+          .single();
+
+        if (subError) {
+          console.error('Failed to insert subscription from webhook:', subError);
+          break;
+        }
+
+        const { error: paymentError } = await supabase.from('payments').insert({
           user_id: userId,
-          plan,
-          status: 'active',
-          stripe_subscription_id: stripeSubscription.id,
+          subscription_id: sub?.id,
+          stripe_payment_id: session.payment_intent,
           amount_pence: amount,
-          current_period_start: new Date(stripeSubscription.current_period_start * 1000),
-          current_period_end:   new Date(stripeSubscription.current_period_end   * 1000),
-        })
-        .select()
-        .single();
+          status: 'succeeded',
+          prize_pool_contrib: prizePoolContrib,
+          charity_contrib: 0,
+        });
 
-      // Record payment
-      await supabase.from('payments').insert({
-        user_id: userId,
-        subscription_id: sub?.id,
-        stripe_payment_id: session.payment_intent,
-        amount_pence: amount,
-        status: 'succeeded',
-        prize_pool_contrib: prizePoolContrib,
-        charity_contrib: 0, // will be calculated from user's charity_percent
-      });
+        if (paymentError) {
+          console.error('Failed to insert payment from webhook:', paymentError);
+        }
 
-      // Send confirmation email
-      const { data: user } = await supabase.from('users').select('email, full_name').eq('id', userId).single();
-      if (user) sendSubscriptionEmail(user.email, user.full_name, plan).catch(console.error);
-      break;
-    }
+        const { data: user } = await supabase.from('users').select('email, full_name').eq('id', userId).single();
+        if (user) sendSubscriptionEmail(user.email, user.full_name, plan).catch(console.error);
+        break;
+      }
 
-    case 'customer.subscription.deleted': {
-      const sub = event.data.object;
-      await supabase
-        .from('subscriptions')
-        .update({ status: 'cancelled', cancelled_at: new Date() })
-        .eq('stripe_subscription_id', sub.id);
-      break;
-    }
-
-    case 'invoice.payment_failed': {
-      const invoice = event.data.object;
-      if (invoice.subscription) {
+      case 'customer.subscription.deleted': {
+        const sub = event.data.object;
         await supabase
           .from('subscriptions')
-          .update({ status: 'lapsed' })
-          .eq('stripe_subscription_id', invoice.subscription);
+          .update({ status: 'cancelled', cancelled_at: new Date() })
+          .eq('stripe_subscription_id', sub.id);
+        break;
       }
-      break;
+
+      case 'invoice.payment_failed': {
+        const invoice = event.data.object;
+        if (invoice.subscription) {
+          await supabase
+            .from('subscriptions')
+            .update({ status: 'lapsed' })
+            .eq('stripe_subscription_id', invoice.subscription);
+        }
+        break;
+      }
     }
+  } catch (err) {
+    console.error('Webhook processing error:', err);
+    return res.status(500).json({ error: 'Webhook processing failed' });
   }
 
   res.json({ received: true });
